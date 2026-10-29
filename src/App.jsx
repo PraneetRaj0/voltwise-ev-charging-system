@@ -1,8 +1,13 @@
 import './App.css'
 import { useEffect, useState } from 'react'
 function App() {
+    const token = sessionStorage.getItem('voltwise_token')
+  const loggedInUser = JSON.parse(
+    sessionStorage.getItem('voltwise_user') || 'null'
+  )
   const [bookings, setBookings] = useState([])
   const [bookingsLoading, setBookingsLoading] = useState(false)
+  const [bookingsError, setBookingsError] = useState('')
   const [stations, setStations] = useState([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
@@ -36,19 +41,32 @@ useEffect(() => {
     setBookingsLoading(true)
 
     try {
-      const response = await fetch('http://localhost:5000/api/bookings')
+      
+const response = await fetch('http://localhost:5000/api/bookings', {
+  cache: 'no-store',
+  headers: {
+    Authorization: `Bearer ${token}`,
+    'Cache-Control': 'no-cache'
+  }
+})
+
 
       if (!response.ok) {
         throw new Error('Failed to load bookings')
       }
 
-      const data = await response.json()
-      setBookings(data)
-    } catch (error) {
-      console.error('Could not load bookings:', error.message)
-    } finally {
-      setBookingsLoading(false)
-    }
+      
+const data = await response.json()
+setBookings(data)
+setBookingsError('')
+} catch (error) {
+  console.error('Could not load bookings:', error.message)
+  setBookings([])
+  setBookingsError(error.message)
+} finally {
+  setBookingsLoading(false)
+}
+
   }
 
   loadBookings()
@@ -82,10 +100,10 @@ const createBooking = async (event) => {
     const response = await fetch('http://localhost:5000/api/bookings', {
       method: 'POST',
       headers: {
-        'Content-Type': 'application/json'
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`
       },
       body: JSON.stringify({
-        user_id: 1,
         connector_id: Number(connectorId),
         start_time: startTime,
         end_time: endTime,
@@ -119,10 +137,17 @@ const cancelBooking = async (bookingId) => {
   if (!confirmed) return
 
   try {
-    const response = await fetch(
-      `http://localhost:5000/api/bookings/${bookingId}/cancel`,
-      { method: 'PATCH' }
-    )
+    
+const response = await fetch(
+  `http://localhost:5000/api/bookings/${bookingId}/cancel`,
+  {
+    method: 'PATCH',
+    headers: {
+      Authorization: `Bearer ${token}`
+    }
+  }
+)
+
 
     const data = await response.json()
 
@@ -372,11 +397,15 @@ const cancelBooking = async (bookingId) => {
     </div>
   </div>
 
-  {bookingsLoading && <p>Loading bookings...</p>}
+ 
+{bookingsLoading && <p>Loading bookings...</p>}
 
-  {!bookingsLoading && bookings.length === 0 && (
-    <p>No bookings found yet.</p>
-  )}
+{bookingsError && <p role="alert">{bookingsError}</p>}
+
+{!bookingsLoading && !bookingsError && bookings.length === 0 && (
+  <p>No bookings found yet.</p>
+)}
+
 
   {bookings.map((booking) => (
     <article className="station" key={booking.booking_id}>
@@ -421,9 +450,9 @@ const cancelBooking = async (bookingId) => {
   <div className="station">
     <div className="station-symbol">👤</div>
     <div className="station-info">
-      <h3>Praneet</h3>
-      <p>Role: EV User</p>
-      <p>Account: VoltWise User</p>
+      <h3>{loggedInUser?.name || 'Customer'}</h3>
+<p>Role: {loggedInUser?.role || 'user'}</p>
+<p>Account: {loggedInUser?.email || ''}</p>
     </div>
   </div>
 </section>

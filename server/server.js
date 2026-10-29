@@ -3,8 +3,10 @@ import express from 'express'
 import cors from 'cors'
 import dotenv from 'dotenv'
 import pool from './db.js'
+import bcrypt from 'bcrypt'
+import jwt from 'jsonwebtoken'
 
-dotenv.config()
+dotenv.config({ path: '../.env' })
 
 const app = express()
 
@@ -56,26 +58,55 @@ app.get('/api/stations', async (req, res) => {
 })
 
 
-app.get('/api/bookings', async (req, res) => {
+
+app.get('/api/bookings', requireAuth, async (req, res) => {
+  console.log('Bookings request:', {
+  user_id: req.auth.user_id,
+  role: req.auth.role
+})
   try {
-    const [bookings] = await pool.query(`
-      SELECT
-        b.booking_id,
-        b.user_id,
-        u.name AS user_name,
-        b.connector_id,
-        s.station_name,
-        c.connector_type,
-        b.start_time,
-        b.end_time,
-        b.requested_power_kw,
-        b.status
-      FROM bookings b
-      JOIN users u ON b.user_id = u.user_id
-      JOIN connectors c ON b.connector_id = c.connector_id
-      JOIN stations s ON c.station_id = s.station_id
-      ORDER BY b.start_time DESC
-    `)
+    let bookings
+
+    if (req.auth.role === 'admin') {
+      ;[bookings] = await pool.query(`
+        SELECT
+          b.booking_id,
+          b.user_id,
+          u.name AS user_name,
+          b.connector_id,
+          s.station_name,
+          c.connector_type,
+          b.start_time,
+          b.end_time,
+          b.requested_power_kw,
+          b.status
+        FROM bookings b
+        JOIN users u ON b.user_id = u.user_id
+        JOIN connectors c ON b.connector_id = c.connector_id
+        JOIN stations s ON c.station_id = s.station_id
+        ORDER BY b.start_time DESC
+      `)
+    } else {
+      ;[bookings] = await pool.query(`
+        SELECT
+          b.booking_id,
+          b.user_id,
+          u.name AS user_name,
+          b.connector_id,
+          s.station_name,
+          c.connector_type,
+          b.start_time,
+          b.end_time,
+          b.requested_power_kw,
+          b.status
+        FROM bookings b
+        JOIN users u ON b.user_id = u.user_id
+        JOIN connectors c ON b.connector_id = c.connector_id
+        JOIN stations s ON c.station_id = s.station_id
+        WHERE b.user_id = ?
+        ORDER BY b.start_time DESC
+      `, [req.auth.user_id])
+    }
 
     res.json(bookings)
   } catch (error) {
@@ -84,14 +115,16 @@ app.get('/api/bookings', async (req, res) => {
   }
 })
 
-app.post('/api/bookings', async (req, res) => {
+
+app.post('/api/bookings', requireAuth, async (req, res) => {
   const {
-    user_id,
-    connector_id,
-    start_time,
-    end_time,
-    requested_power_kw
-  } = req.body
+  connector_id,
+  start_time,
+  end_time,
+  requested_power_kw
+} = req.body
+
+const user_id = req.auth.user_id
 
   if (!user_id || !connector_id || !start_time ||
       !end_time || !requested_power_kw) {
@@ -174,7 +207,7 @@ app.post('/api/bookings', async (req, res) => {
 })
 
 
-app.patch('/api/bookings/:id/cancel', async (req, res) => {
+app.patch('/api/bookings/:id/cancel', requireAuth, async (req, res) => {
   const bookingId = Number(req.params.id)
 
   if (!Number.isInteger(bookingId) || bookingId < 1) {
@@ -183,12 +216,13 @@ app.patch('/api/bookings/:id/cancel', async (req, res) => {
 
   try {
     const [result] = await pool.query(
-      `UPDATE bookings
-       SET status = 'cancelled'
-       WHERE booking_id = ?
-         AND status = 'confirmed'
-         AND start_time > NOW()`,
-      [bookingId]
+    `UPDATE bookings
+ SET status = 'cancelled'
+ WHERE booking_id = ?
+   AND status = 'confirmed'
+   AND start_time > NOW()
+   AND (? = 'admin' OR user_id = ?)` ,
+      [bookingId, req.auth.role, req.auth.user_id]
     )
 
     if (result.affectedRows === 0) {
@@ -233,6 +267,140 @@ app.get('/api/energy', async (req, res) => {
     console.error('Could not fetch energy data:', error.message)
     res.status(500).json({ error: 'Could not fetch energy data' })
   }
+})
+
+
+function createToken(user) {
+  if (!process.env.JWT_SECRET) {
+    throw new Error('JWT_SECRET is missing from .env')
+  }
+
+  return jwt.sign(
+    { user_id: user.user_id, role: user.role },
+    process.env.JWT_SECRET,
+    { expiresIn: '2h' }
+  )
+}
+
+function requireAuth(req, res, next) {
+  const authHeader = req.headers.authorization
+  const token = authHeader?.startsWith('Bearer ')
+    ? authHeader.slice(7)
+    : null
+
+  if (!token) {
+    return res.status(401).json({ error: 'Please log in first' })
+  }
+
+  try {
+    req.auth = jwt.verify(token, process.env.JWT_SECRET)
+    next()
+  } catch {
+    return res.status(401).json({ error: 'Invalid or expired login' })
+  }
+}
+
+function requireAdmin(req, res, next) {
+  if (req.auth?.role !== 'admin') {
+    return res.status(403).json({ error: 'Administrator access required' })
+  }
+  next()
+}
+
+app.post('/api/auth/register', async (req, res) => {
+  const { name, email, password } = req.body
+
+  if (
+    typeof name !== 'string' ||
+    typeof email !== 'string' ||
+    typeof password !== 'string' ||
+    !name.trim() ||
+    !email.trim() ||
+    password.length < 8 ||
+    password.length > 72
+  ) {
+    return res.status(400).json({
+      error: 'Enter your name, email, and a password of 8–72 characters'
+    })
+  }
+
+  try {
+    const normalizedEmail = email.trim().toLowerCase()
+    const [existing] = await pool.query(
+      'SELECT user_id FROM users WHERE email = ?',
+      [normalizedEmail]
+    )
+
+    if (existing.length) {
+      return res.status(409).json({ error: 'Email is already registered' })
+    }
+
+    const passwordHash = await bcrypt.hash(password, 12)
+    const [result] = await pool.query(
+      `INSERT INTO users (name, email, password_hash, role)
+       VALUES (?, ?, ?, 'user')`,
+      [name.trim(), normalizedEmail, passwordHash]
+    )
+
+    res.status(201).json({
+      message: 'Customer account created successfully',
+      user_id: result.insertId
+    })
+  } catch (error) {
+    console.error('Registration failed:', error.message)
+    res.status(500).json({ error: 'Could not create account' })
+  }
+})
+
+app.post('/api/auth/login', async (req, res) => {
+  const { email, password } = req.body
+
+  if (
+    typeof email !== 'string' ||
+    typeof password !== 'string' ||
+    !email.trim() ||
+    !password
+  ) {
+    return res.status(400).json({ error: 'Enter your email and password' })
+  }
+
+  try {
+    const [users] = await pool.query(
+      `SELECT user_id, name, email, password_hash, role
+       FROM users WHERE email = ?`,
+      [email.trim().toLowerCase()]
+    )
+
+    if (!users.length) {
+      return res.status(401).json({ error: 'Invalid email or password' })
+    }
+
+    const user = users[0]
+    const matches = await bcrypt.compare(password, user.password_hash)
+
+    if (!matches) {
+      return res.status(401).json({ error: 'Invalid email or password' })
+    }
+
+    const token = createToken(user)
+    res.json({
+      message: 'Login successful',
+      token,
+      user: {
+        user_id: user.user_id,
+        name: user.name,
+        email: user.email,
+        role: user.role
+      }
+    })
+  } catch (error) {
+    console.error('Login failed:', error.message)
+    res.status(500).json({ error: 'Could not log in' })
+  }
+})
+
+app.get('/api/admin/check', requireAuth, requireAdmin, (req, res) => {
+  res.json({ message: 'Administrator access verified' })
 })
 
 const PORT = process.env.PORT || 5000
